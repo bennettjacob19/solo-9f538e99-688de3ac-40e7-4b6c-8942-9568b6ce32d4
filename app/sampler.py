@@ -64,6 +64,9 @@ class TraceSampler:
         self.clock: Callable[[], float] = clock or time.monotonic
 
         self._lock = threading.RLock()
+        # Serializes archive writes against a volume switch: no write may be
+        # in flight while the storage layer closes and replaces its connection.
+        self._write_gate = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -78,6 +81,16 @@ class TraceSampler:
         # Protects against the worker thread and an HTTP-triggered tick
         # writing the same pending trace concurrently.
         self._writing: set[str] = set()
+
+        # Seal state.  A trace id in ``_seal_old_targets`` had already closed
+        # its window when the seal was accepted and therefore finishes in the
+        # old volume; everything else is routed to the new volume.
+        self._seal_active = False
+        self._seal_old_file: Optional[str] = None
+        self._seal_new_file: Optional[str] = None
+        self._seal_old_targets: set[str] = set()
+        self.seal_error: Optional[str] = None
+        self.seal_started_at: Optional[float] = None
 
         self.totals = {
             "spans_accepted": 0,
@@ -131,6 +144,104 @@ class TraceSampler:
         with self._lock:
             self._paused = False
         self._wake.set()
+
+    # ------------------------------------------------------------------ seal
+    def begin_seal(self) -> dict:
+        """Accept a seal request from the UI/API.
+
+        Traces already pending at this instant have closed windows and remain
+        bound to the old volume; everything still collecting, and every trace
+        admitted later, targets the new volume.
+        """
+        with self._lock:
+            if self._seal_active:
+                raise RuntimeError("a seal is already in progress")
+            # Snapshot under the lock: expire first so the split point is
+            # unambiguous, then record exactly the old-volume population.
+            self._expire_locked(self.clock())
+            old_targets = list(self._pending.keys())
+            try:
+                seal = self.store.begin_seal(old_targets)
+            except Exception as exc:
+                self.seal_error = f"{type(exc).__name__}: {exc}"
+                raise
+            self._seal_active = True
+            self._seal_old_file = seal.old_file
+            self._seal_new_file = seal.new_file
+            self._seal_old_targets = set(old_targets)
+            for item in self._pending.values():
+                item.target_file = seal.old_file
+            self.seal_error = None
+            self.seal_started_at = seal.started_at
+            info = {
+                "oldFile": seal.old_file,
+                "newFile": seal.new_file,
+                "oldVolumePending": len(old_targets),
+            }
+        self._wake.set()
+        return info
+
+    def _check_seal_progress(self) -> None:
+        """Switch volumes as soon as the old volume's queue is empty."""
+        with self._lock:
+            if not self._seal_active:
+                return
+            old_file = self._seal_old_file
+            drained = all(
+                item.target_file != old_file for item in self._pending.values()
+            )
+        if not drained:
+            return
+        # The gate makes the connection swap mutually exclusive with writes.
+        with self._write_gate:
+            # Re-check under both the state lock and the gate: another tick may
+            # have completed the seal while we waited for an in-flight write.
+            with self._lock:
+                if not self._seal_active:
+                    return
+            try:
+                record = self.store.finish_seal(True)
+            except Exception as exc:
+                with self._lock:
+                    self._seal_active = False
+                    self.seal_error = f"{type(exc).__name__}: {exc}"
+                    # Failed seals keep writing the old volume: every pending
+                    # trace (including ones routed at the new file) is retargeted
+                    # and processed by the normal write/retry rules.
+                    self._seal_old_file = None
+                    self._seal_new_file = None
+                    self._seal_old_targets.clear()
+                    for item in self._pending.values():
+                        item.target_file = None
+                log.warning("seal failed, keeping old volume: %s", exc)
+                return
+            if record is None:
+                return
+            with self._lock:
+                self._seal_active = False
+                self._seal_old_file = None
+                self._seal_new_file = None
+                self._seal_old_targets.clear()
+                self.seal_started_at = None
+                # New-volume pending traces can now be committed on later ticks.
+                for item in self._pending.values():
+                    item.target_file = None
+        self._wake.set()
+
+    @property
+    def sealing(self) -> bool:
+        with self._lock:
+            return self._seal_active
+
+    def recover_seal(self) -> None:
+        """Adopt an interrupted seal reported by the storage layer."""
+        with self._lock:
+            state = self.store.snapshot()
+        if not state.get("sealing"):
+            return
+        record = self.store.recover_interrupted_seal()
+        if record is not None:
+            log.info("interrupted seal recovered, volume %s frozen", record.file)
 
     # ---------------------------------------------------------------- ingest
     def ingest(self, spans: list[SpanRecord], invalid: int = 0) -> IngestResult:
@@ -245,12 +356,29 @@ class TraceSampler:
             # Keep the expired snapshot and, with it, the slot.  The slot is
             # freed only when ArchiveStore.write_trace commits.
             spans = sorted(trace.spans.values(), key=lambda s: (s.seq, s.span_id))
+            target_file = self._target_file_locked(trace_id)
             self._pending[trace_id] = PendingArchive(
-                trace_id=trace_id, spans=spans, expired_at=now
+                trace_id=trace_id,
+                spans=spans,
+                expired_at=now,
+                target_file=target_file,
             )
             self._next_attempt[trace_id] = now
             self._retry_delay[trace_id] = 0.0
         self._prune_closed_locked(now)
+
+    def _target_file_locked(self, trace_id: str) -> Optional[str]:
+        """Pick the volume for a trace expiring right now.
+
+        Traces already queued when the seal was accepted (window closed) go to
+        the old volume; traces still open then, or admitted afterwards, go to
+        the new one.  With no seal active the manager picks the current file.
+        """
+        if not self._seal_active:
+            return None
+        if trace_id in self._seal_old_targets:
+            return self._seal_old_file
+        return self._seal_new_file
 
     # ---------------------------------------------------------------- worker
     def _has_work(self) -> bool:
@@ -291,9 +419,19 @@ class TraceSampler:
                     with self._lock:
                         self._writing.discard(item.trace_id)
 
+        self._check_seal_progress()
+
     def _write_pending(self, item: PendingArchive) -> None:
         try:
-            self.store.write_trace(item.trace_id, item.spans)
+            # Hold the write gate across the storage call so a volume switch
+            # can never close the connection mid-write.
+            with self._write_gate:
+                if item.target_file is not None:
+                    self.store.write_trace(
+                        item.trace_id, item.spans, target_file=item.target_file
+                    )
+                else:
+                    self.store.write_trace(item.trace_id, item.spans)
         except Exception as exc:
             with self._lock:
                 item.attempts += 1
@@ -336,9 +474,23 @@ class TraceSampler:
                     "spanCount": len(item.spans),
                     "attempts": item.attempts,
                     "lastError": item.last_error,
+                    "targetFile": os.path.basename(item.target_file)
+                    if item.target_file
+                    else None,
                 }
                 for item in self._pending.values()
             ]
+            old_file = (
+                os.path.basename(self._seal_old_file) if self._seal_old_file else None
+            )
+            new_file = (
+                os.path.basename(self._seal_new_file) if self._seal_new_file else None
+            )
+            old_volume_pending = sum(
+                1
+                for item in self._pending.values()
+                if item.target_file == self._seal_old_file
+            )
             return {
                 "paused": self._paused,
                 "capacity": self.capacity,
@@ -348,5 +500,11 @@ class TraceSampler:
                 "windowSeconds": self.window_seconds,
                 "maxSpansPerTrace": self.max_spans_per_trace,
                 "lastError": self.last_error,
+                "sealing": self._seal_active,
+                "sealError": self.seal_error,
+                "sealStartedAt": self.seal_started_at,
+                "sealOldFile": old_file,
+                "sealNewFile": new_file,
+                "sealOldVolumePending": old_volume_pending,
                 "totals": dict(self.totals),
             }

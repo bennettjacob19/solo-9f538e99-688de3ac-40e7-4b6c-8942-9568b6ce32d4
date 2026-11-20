@@ -53,6 +53,46 @@ archiving resumes — or when a failed SQLite write later succeeds — every pen
 trace is written automatically. Write failures use exponential backoff (max
 30s) and never lose the expired content.
 
+## Volume sealing ("封卷")
+
+At shift handover the on-call engineer can take away one complete file of the
+error traces collected so far, while the collector keeps receiving spans. Every
+archive is a single SQLite **volume**; the overview page shows the current
+write volume and offers *Seal current volume*.
+
+The split rule, relative to the moment a seal request is **accepted**:
+
+1. Traces whose sampling window has already closed (the pending archive queue)
+   keep being written into the **old volume**, even if their write is still
+   retrying.
+2. Traces whose window is still open, and traces admitted afterwards, are
+   routed to the **new volume** if they end up archived.
+3. `POST /v1/traces` keeps accepting spans throughout with the unchanged
+   2-second window and 16-slot rules; the overview keeps showing already
+   committed traces normally.
+4. A second seal request while one is running is refused (`409` on the API,
+   silently ignored on the HTML form) — the page simply shows *sealing…*.
+5. The write path switches **only** after all of these hold:
+   - every old-volume pending trace has been committed;
+   - the old WAL is folded into the database and the file is converted to
+     rollback journal mode, so the sealed volume is one self-contained `.db`
+     with no `-wal`/`-shm` side files;
+   - an independent read-only connection re-reads **every** trace and passes
+     `PRAGMA integrity_check`;
+   - the replacement volume accepts a committed write probe.
+6. If any gate fails the seal is aborted, the old volume stays the write
+   volume, already received traces follow the normal write/retry rules, and
+   the overview shows the failure reason. A fresh seal can be requested later.
+7. A `volumes.json` manifest next to the databases records the current write
+   volume and every sealed file. After a restart the service reopens the last
+   successfully switched write volume, resumes (or aborts) an interrupted
+   seal, and keeps every sealed volume downloadable.
+
+Sealed volumes are listed on the overview with trace/span counts, size and a
+SHA-256, and downloaded through `GET /volumes/{file}` (path traversal is
+rejected). Trace detail pages and the archived table label each trace with its
+source volume.
+
 ## Run with Docker Compose
 
 ```bash
@@ -69,8 +109,11 @@ set in a `.env` file next to `docker-compose.yml`:
 | `SAMPLE_WINDOW_SECONDS` | `2` | collection window per trace |
 | `MAX_ACTIVE_TRACES` | `16` | traces occupying slots |
 | `MAX_SPANS_PER_TRACE` | `64` | distinct spans kept per trace |
-| `DB_PATH` | `/data/traces.db` | SQLite file (container) |
+| `DB_PATH` | `/data/traces.db` | first/current SQLite volume (container) |
 | `LOG_LEVEL` | `INFO` | log level |
+
+Sealed volumes and the `volumes.json` manifest are written next to `DB_PATH`,
+so mounting the `/data` volume preserves them across container restarts.
 
 ## Run locally
 
@@ -109,10 +152,14 @@ Only OTLP/HTTP JSON is decoded; protobuf exports receive HTTP 415.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `POST` | `/v1/traces` | OTLP/HTTP JSON export |
-| `GET` | `/` | overview: status, archived traces, pause/resume |
+| `GET` | `/` | overview: status, volumes, archived traces, pause/resume |
 | `GET` | `/traces/{traceId}` | every archived span of one trace |
+| `POST` | `/seal` | seal the current write volume (HTML form) |
+| `GET` | `/volumes/{file}` | download a sealed SQLite volume |
 | `GET` | `/api/status` | sampler state and counters |
-| `GET` | `/api/traces` | archived traces (`limit`, `offset`) |
+| `GET` | `/api/volumes` | current write volume and sealed volume list |
+| `POST` | `/api/volumes/seal` | seal the current write volume (JSON) |
+| `GET` | `/api/traces` | archived traces across all volumes (`limit`, `offset`) |
 | `GET` | `/api/traces/{traceId}` | archived trace as JSON |
 | `POST` | `/api/archive/pause` · `/api/archive/resume` | pause / resume archiving |
 | `GET` | `/healthz` | liveness |
@@ -121,8 +168,9 @@ Only OTLP/HTTP JSON is decoded; protobuf exports receive HTTP 415.
 
 ```
 app/otlp.py      OTLP/HTTP JSON parsing and response shaping
-app/sampler.py   window/slot state machine, dedupe, cap, pause, retry
-app/storage.py   transactional SQLite archive
+app/sampler.py   window/slot state machine, dedupe, cap, pause, retry, seal routing
+app/storage.py   transactional SQLite archive and read-only verification helpers
+app/volumes.py   volume manager, seal state machine, manifest, cross-volume reads
 app/main.py      FastAPI app factory, routes, templates
-tests/           sampler unit tests and HTTP-level tests
+tests/           sampler, HTTP and volume-sealing tests
 ```

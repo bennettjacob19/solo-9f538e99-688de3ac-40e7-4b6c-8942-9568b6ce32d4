@@ -1,5 +1,59 @@
 {% extends "base.html" %}
 {% block content %}
+{% if volumes %}
+<div class="card" style="margin-bottom:22px">
+  <div class="toolbar" style="margin:0">
+    <div>
+      <div class="label">Current write volume</div>
+      <div class="mono" style="margin-top:4px">{{ volumes.currentFile }}</div>
+      <div class="small muted">{{ volumes.dataDir }}</div>
+    </div>
+    <span class="spacer"></span>
+    {% if volumes.sealing %}
+      <span class="badge warn">SEALING…</span>
+    {% else %}
+      <form class="inline" method="post" action="/seal">
+        <button class="primary" type="submit">{{ 'Retry seal' if (status.sealError or volumes.lastError) else 'Seal current volume' }}</button>
+      </form>
+      {% if status.sealError or volumes.lastError %}
+      <span class="badge err">SEAL FAILED</span>
+      {% endif %}
+    {% endif %}
+  </div>
+  {% if volumes.sealing %}
+  <div class="small muted" style="margin-top:8px">
+    Freezing <strong class="mono">{{ status.sealOldFile }}</strong> → new write volume
+    <strong class="mono">{{ status.sealNewFile }}</strong>.
+    {{ status.sealOldVolumePending }} trace(s) still finishing into the old volume;
+    span collection continues with the same window and slot rules.
+  </div>
+  {% elif status.sealError or volumes.lastError %}
+  <div class="small error-text" style="margin-top:8px">
+    Seal failed, writes continue on the old volume. Reason: {{ status.sealError or volumes.lastError }}
+  </div>
+  {% endif %}
+</div>
+{% if volumes.sealed %}
+<h2>Sealed volumes ({{ volumes.sealed|length }})</h2>
+<table>
+  <thead><tr><th>File</th><th>Sealed (UTC)</th><th>Traces</th><th>Spans</th><th>Size</th><th>SHA-256</th><th></th></tr></thead>
+  <tbody>
+  {% for v in volumes.sealed|reverse %}
+    <tr>
+      <td class="mono small">{{ v.file }}</td>
+      <td class="mono small">{{ v.sealed_at|utc_time }}</td>
+      <td class="mono">{{ v.trace_count }}</td>
+      <td class="mono">{{ v.span_count }}</td>
+      <td class="mono small">{{ v.size_bytes }} B</td>
+      <td class="mono small muted">{{ v.sha256[:12] }}…</td>
+      <td><a href="/volumes/{{ v.file }}">Download</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endif %}
+
 <div class="grid">
   <div class="card"><div class="label">Archived traces</div><div class="value">{{ total }}</div></div>
   <div class="card"><div class="label">Slots in use</div><div class="value">{{ status.slotsUsed }} / {{ status.capacity }}</div>
@@ -32,7 +86,7 @@
 <h2>Archived traces</h2>
 {% if traces %}
 <table>
-  <thead><tr><th>Trace ID</th><th>Root operation</th><th>Services</th><th>Spans</th><th>Duration</th><th>Archived</th></tr></thead>
+  <thead><tr><th>Trace ID</th><th>Root operation</th><th>Services</th><th>Spans</th><th>Duration</th><th>Volume</th><th>Archived</th></tr></thead>
   <tbody>
   {% for t in traces %}
     <tr>
@@ -42,6 +96,7 @@
       <td>{% for s in t.service_names %}<span class="tag">{{ s }}</span>{% endfor %}</td>
       <td class="mono">{{ t.span_count }}</td>
       <td class="mono">{{ t.duration_ns|duration }}</td>
+      <td class="mono small">{% if t.volume_sealed %}<span class="badge">{{ t.volume_file }}</span>{% else %}<span class="badge ok">{{ t.volume_file }}</span>{% endif %}</td>
       <td class="mono small">{{ t.archived_at_ns|utc_time }}</td>
     </tr>
   {% endfor %}

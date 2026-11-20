@@ -4,6 +4,11 @@
 <div class="toolbar">
   <a href="/">← All traces</a>
   <span class="spacer"></span>
+  {% if trace.volume_file %}
+  <span class="badge {% if trace.volume_sealed %}{% else %}ok{% endif %}">
+    {{ 'sealed' if trace.volume_sealed else 'write' }} volume: {{ trace.volume_file }}
+  </span>
+  {% endif %}
   <span class="badge {% if trace.error_count %}err{% else %}ok{% endif %}">{{ trace.error_count }} ERROR / {{ trace.span_count }} spans</span>
 </div>
 

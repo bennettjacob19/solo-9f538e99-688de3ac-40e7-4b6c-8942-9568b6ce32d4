@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from .otlp import OtlpParseError, export_response, parse_trace_request
@@ -23,7 +23,7 @@ from .sampler import (
     DEFAULT_WINDOW_SECONDS,
     TraceSampler,
 )
-from .storage import ArchiveStore
+from .volumes import VolumeError, VolumeManager
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -106,7 +106,7 @@ def create_app(
     clock: Optional[Callable[[], float]] = None,
 ) -> FastAPI:
     db_path = db_path or os.environ.get("DB_PATH", DEFAULT_DB_PATH)
-    store = ArchiveStore(db_path)
+    store = VolumeManager(db_path)
     sampler = TraceSampler(
         store,
         window_seconds=window_seconds
@@ -127,11 +127,13 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        # Finish (or abort) a seal that was interrupted by the last shutdown.
+        sampler.recover_seal()
         if start_sampler_thread:
             sampler.start()
         log.info(
             "tail sampler ready db=%s window=%.2fs capacity=%d max_spans=%d",
-            db_path,
+            getattr(store, "path", db_path),
             sampler.window_seconds,
             sampler.capacity,
             sampler.max_spans_per_trace,
@@ -152,7 +154,11 @@ def create_app(
         )
 
     def page_context(request: Request, **extra) -> dict:
-        context = {"status": sampler.snapshot(), "request": request}
+        context = {
+            "status": sampler.snapshot(),
+            "volumes": store.snapshot(),
+            "request": request,
+        }
         context.update(extra)
         return context
 
@@ -252,12 +258,72 @@ def create_app(
         flush_due_writes()
         return overview(request)
 
+    # -- Volume sealing -----------------------------------------------------
+    @app.post("/seal", response_class=HTMLResponse)
+    async def page_seal(request: Request):
+        try:
+            sampler.begin_seal()
+        except RuntimeError as exc:
+            log.info("seal request ignored: %s", exc)
+        flush_due_writes()
+        return overview(request)
+
+    @app.get("/volumes/{file_name}")
+    async def download_volume(file_name: str):
+        path = store.download_path(file_name)
+        if path is None:
+            return JSONResponse(status_code=404, content={"error": "unknown volume"})
+        return FileResponse(
+            path,
+            media_type="application/x-sqlite3",
+            filename=file_name,
+        )
+
     # -- JSON API -----------------------------------------------------------
     @app.get("/api/status")
     async def api_status() -> dict:
         snapshot = sampler.snapshot()
         snapshot["archivedTraces"] = store.count()
+        snapshot["volumes"] = store.snapshot()
         return snapshot
+
+    @app.post("/api/volumes/seal")
+    async def api_seal() -> JSONResponse:
+        try:
+            info = sampler.begin_seal()
+        except (RuntimeError, VolumeError) as exc:
+            return JSONResponse(
+                status_code=409, content={"error": str(exc), "sealing": True}
+            )
+        flush_due_writes()
+        if sampler.sealing:
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "accepted": True,
+                    "sealing": True,
+                    "oldVolumePending": info["oldVolumePending"],
+                    "volumes": store.snapshot(),
+                },
+            )
+        # The old queue was already empty: the switch either completed inside
+        # this call or failed and rolled back onto the old volume.
+        failed = sampler.seal_error or store.snapshot().get("lastError")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "accepted": True,
+                "sealing": False,
+                "failed": bool(failed),
+                "error": failed,
+                "oldVolumePending": info["oldVolumePending"],
+                "volumes": store.snapshot(),
+            },
+        )
+
+    @app.get("/api/volumes")
+    async def api_volumes() -> dict:
+        return store.snapshot()
 
     @app.get("/api/traces")
     async def api_traces(limit: int = 100, offset: int = 0) -> dict:

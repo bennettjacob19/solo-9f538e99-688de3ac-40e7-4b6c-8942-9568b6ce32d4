@@ -69,6 +69,9 @@
     archiving {{ 'PAUSED' if status.paused else 'ACTIVE' }}
   </span>
   <span class="badge">slots {{ status.slotsUsed }}/{{ status.capacity }}</span>
+  {% if status.sealing %}
+  <span class="badge warn">SEALING {{ status.sealOldVolumePending }} left</span>
+  {% endif %}
   <span class="spacer"></span>
   {% if status.paused %}
     <form class="inline" method="post" action="/resume"><button class="primary">Resume archiving</button></form>

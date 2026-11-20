@@ -3,6 +3,9 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+.pylibs/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/volumes.json
+data/volumes.json.tmp

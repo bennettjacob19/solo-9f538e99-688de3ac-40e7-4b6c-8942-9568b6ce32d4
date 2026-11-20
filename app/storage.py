@@ -63,6 +63,11 @@ CREATE INDEX IF NOT EXISTS idx_archived_traces_archived_at
     ON archived_traces (archived_at_ns DESC);
 CREATE INDEX IF NOT EXISTS idx_archived_spans_trace
     ON archived_spans (trace_id, seq);
+
+CREATE TABLE IF NOT EXISTS volume_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -88,8 +93,41 @@ class ArchiveStore:
         with self._lock:
             self._conn.close()
 
-    def write_trace(self, trace_id: str, spans: list[SpanRecord]) -> None:
-        """Atomically archive a whole trace.  Raises on any failure."""
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO volume_meta (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
+            self._conn.commit()
+
+    def get_meta(self, key: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM volume_meta WHERE key = ?", (key,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def checkpoint_wal(self) -> None:
+        """Fold the WAL into the main database file and drop side files."""
+        with self._lock:
+            self._conn.commit()
+            # TRUNCATE zeroes the -wal file once every frame is checkpointed,
+            # so a sealed volume really is one self-contained .db file.
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def write_trace(
+        self,
+        trace_id: str,
+        spans: list[SpanRecord],
+        target_file: Optional[str] = None,
+    ) -> None:
+        """Atomically archive a whole trace.  Raises on any failure.
+
+        ``target_file`` is accepted for parity with :class:`VolumeManager`;
+        a single-file store always writes its own database.
+        """
 
         if not spans:
             raise ValueError("refusing to archive an empty trace")
@@ -223,3 +261,131 @@ class ArchiveStore:
                 span[key[:-5]] = {}
         span["is_error"] = span.get("status_code") == "ERROR"
         return span
+
+    # ----------------------------------------------------------------- volume
+    # The helpers below operate on any database file, including sealed
+    # volumes that are opened read-only for verification or download checks.
+    @staticmethod
+    def open_readonly(path: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            f"file:{os.path.abspath(path)}?mode=ro",
+            uri=True,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @classmethod
+    def count_in(cls, conn: sqlite3.Connection) -> int:
+        return int(
+            conn.execute("SELECT COUNT(*) FROM archived_traces").fetchone()[0]
+        )
+
+    @classmethod
+    def read_all_trace_ids(cls, conn: sqlite3.Connection) -> list[str]:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT trace_id FROM archived_traces ORDER BY trace_id"
+            ).fetchall()
+        ]
+
+    @classmethod
+    def read_trace(cls, conn: sqlite3.Connection, trace_id: str) -> Optional[dict[str, Any]]:
+        row = conn.execute(
+            "SELECT * FROM archived_traces WHERE trace_id = ?", (trace_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        span_rows = conn.execute(
+            "SELECT * FROM archived_spans WHERE trace_id = ? ORDER BY seq, span_id",
+            (trace_id,),
+        ).fetchall()
+        trace = dict(row)
+        trace["service_names"] = json.loads(trace.get("service_names") or "[]")
+        trace["spans"] = [cls._span_from_row(span) for span in span_rows]
+        return trace
+
+    @classmethod
+    def list_traces_in(
+        cls, conn: sqlite3.Connection, limit: int, offset: int
+    ) -> tuple[list[dict], int]:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        total = cls.count_in(conn)
+        rows = conn.execute(
+            "SELECT trace_id, archived_at_ns, span_count, error_count,"
+            " root_name, service_names, duration_ns, min_start_ns"
+            " FROM archived_traces ORDER BY archived_at_ns DESC"
+            " LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        traces = []
+        for row in rows:
+            item = dict(row)
+            item["service_names"] = json.loads(item.get("service_names") or "[]")
+            traces.append(item)
+        return traces, int(total)
+
+    @classmethod
+    def all_trace_summaries(cls, conn: sqlite3.Connection) -> list[dict]:
+        """Every archive summary, ordered newest first (no row cap)."""
+        rows = conn.execute(
+            "SELECT trace_id, archived_at_ns, span_count, error_count,"
+            " root_name, service_names, duration_ns, min_start_ns"
+            " FROM archived_traces ORDER BY archived_at_ns DESC"
+        ).fetchall()
+        traces = []
+        for row in rows:
+            item = dict(row)
+            item["service_names"] = json.loads(item.get("service_names") or "[]")
+            traces.append(item)
+        return traces
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        return self._conn
+
+    @classmethod
+    def verify_readable(cls, conn: sqlite3.Connection) -> dict[str, Any]:
+        """Read every archived trace end to end.
+
+        Used to prove a sealed volume's full contents are recoverable from the
+        single SQLite file before the write path is switched away from it.
+        """
+        trace_ids = cls.read_all_trace_ids(conn)
+        span_total = 0
+        for trace_id in trace_ids:
+            trace = cls.read_trace(conn, trace_id)
+            if trace is None:
+                raise RuntimeError(f"trace {trace_id} listed but not readable")
+            span_total += len(trace["spans"])
+        return {"traces": len(trace_ids), "spans": span_total}
+
+    @staticmethod
+    def probe_writable(path: str) -> None:
+        """Create/open the file and prove a transaction can commit.
+
+        Leaves behind only the (empty) bookkeeping table; the probe row itself
+        is removed so a freshly activated volume carries no test data.
+        """
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        probe = sqlite3.connect(path, timeout=10.0)
+        try:
+            probe.execute("PRAGMA journal_mode = WAL")
+            probe.execute(
+                "CREATE TABLE IF NOT EXISTS volume_meta ("
+                " key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            probe.execute("BEGIN IMMEDIATE")
+            probe.execute(
+                "INSERT INTO volume_meta (key, value) VALUES ('write_probe', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(time.time_ns()),),
+            )
+            probe.commit()
+            probe.execute("DELETE FROM volume_meta WHERE key = 'write_probe'")
+            probe.commit()
+        finally:
+            probe.close()

@@ -52,6 +52,9 @@ class PendingArchive:
     expired_at: float
     attempts: int = 0
     last_error: Optional[str] = None
+    # SQLite volume file this trace must be written to.  Set when the trace's
+    # window expires while a seal is in progress.
+    target_file: Optional[str] = None
 
 
 @dataclass
